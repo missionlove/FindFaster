@@ -52,3 +52,21 @@ compile_commands.json
 *creator.user*
 
 *_qmlcache.qrc
+
+# Project build outputs
+/bin/
+/FindFaster/release/
+/FindFaster/debug/
+/libfinder/release/
+/libfinder/debug/
+/tests/libfinder_tests/release/
+/tests/libfinder_tests/debug/
+
+# Common compiler/linker artifacts (Windows)
+*.obj
+*.exe
+*.exp
+*.lib
+*.ilk
+*.idb
+*.pdb
