@@ -20,11 +20,13 @@ DEFINES += QT_DEPRECATED_WARNINGS
 SOURCES += \
     main.cpp \
     findfasterwidget.cpp \
+    finderresultitemdelegate.cpp \
     findresultsmodel.cpp \
     win_shell_context_menu.cpp
 
 HEADERS += \
     findfasterwidget.h \
+    finderresultitemdelegate.h \
     findresultsmodel.h \
     win_shell_context_menu.h
 

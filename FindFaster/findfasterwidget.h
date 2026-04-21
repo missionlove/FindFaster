@@ -21,6 +21,7 @@ class QComboBox;
 class QScrollBar;
 class QShowEvent;
 class FinderResultsModel;
+class FinderResultItemDelegate;
 
 struct FinderSearchJob
 {
@@ -67,7 +68,12 @@ private:
     static constexpr int kRenderChunkRowsDefault = 200;
     static constexpr int kRenderChunkRowsMin = 80;
     static constexpr int kRenderChunkRowsMax = 1200;
+    static constexpr int kViewportAheadRows = 600;
+    static constexpr int kViewportBackfillRows = 240;
+    static constexpr int kViewportPrefetchRows = 900;
     static constexpr int kStableHeadRows = 20;
+    static constexpr int kIconRefreshIntervalMs = 16;
+    static constexpr int kIconRefreshChunkRows = 200;
     void buildUi();
     void buildMenus();
     void runDeferredIndexBuild();
@@ -79,6 +85,8 @@ private:
     QString runtimeMetricsText() const;
     void adaptRenderChunkRows();
     void logStartupMetricsIfReady();
+    void renderStatusTextNow();
+    void scheduleIconResume();
     void applyDisplayResults();
     void startLoadNextPage();
     void startProgressiveDisplay();
@@ -94,11 +102,15 @@ private:
     QComboBox *m_driveFilterCombo = nullptr;
     QTableView *m_resultView = nullptr;
     FinderResultsModel *m_resultModel = nullptr;
+    FinderResultItemDelegate *m_itemDelegate = nullptr;
     QLabel *m_leftStatus = nullptr;
     QLabel *m_rightStatus = nullptr;
     QTimer *m_searchDebounceTimer = nullptr;
     QTimer *m_loadMoreDebounceTimer = nullptr;
     QTimer *m_progressiveRenderTimer = nullptr;
+    QTimer *m_statusUpdateTimer = nullptr;
+    QTimer *m_resumeIconsTimer = nullptr;
+    QTimer *m_iconRefreshTimer = nullptr;
 
     QFutureWatcher<FinderSearchJob> *m_mainSearchWatcher = nullptr;
     QFutureWatcher<FinderSearchJob> *m_pageSearchWatcher = nullptr;
@@ -135,5 +147,8 @@ private:
     qint64 m_lastSearchComputeMs = -1;
     qint64 m_lastApplyDisplayMs = -1;
     int m_renderChunkRows = kRenderChunkRowsDefault;
+    bool m_statusUpdatePending = false;
+    int m_iconRefreshNextRow = 0;
+    int m_viewportAnchorRow = 0;
 };
 #endif // FINDFASTERWIDGET_H

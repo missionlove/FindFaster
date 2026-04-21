@@ -1,4 +1,5 @@
 #include "findfasterwidget.h"
+#include "finderresultitemdelegate.h"
 #include "findresultsmodel.h"
 #include "ntfsusn_utils.h"
 #include "win_shell_context_menu.h"
@@ -189,6 +190,18 @@ void FindFasterWidget::onSearchCommitted()
 
 void FindFasterWidget::updateStatus()
 {
+    if (!m_statusUpdateTimer) {
+        renderStatusTextNow();
+        return;
+    }
+    m_statusUpdatePending = true;
+    if (!m_statusUpdateTimer->isActive()) {
+        m_statusUpdateTimer->start();
+    }
+}
+
+void FindFasterWidget::renderStatusTextNow()
+{
     const FinderIndexStats stats = m_engine.stats();
     const QString timeText = stats.indexedAt.isValid()
             ? stats.indexedAt.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))
@@ -254,17 +267,22 @@ void FindFasterWidget::buildUi()
     layout->addLayout(topRowLayout);
 
     m_resultModel = new FinderResultsModel(central);
+    m_itemDelegate = new FinderResultItemDelegate(central);
     m_resultView = new QTableView(central);
     m_resultView->setModel(m_resultModel);
+    m_resultView->setItemDelegate(m_itemDelegate);
     m_resultView->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_resultView->setSelectionMode(QAbstractItemView::ExtendedSelection);
     m_resultView->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    m_resultView->setAlternatingRowColors(true);
+    m_resultView->setAlternatingRowColors(false);
     m_resultView->setShowGrid(false);
+    m_resultView->setSortingEnabled(false);
     m_resultView->setWordWrap(false);
     m_resultView->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
     m_resultView->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
     m_resultView->verticalHeader()->setVisible(false);
+    m_resultView->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
+    m_resultView->verticalHeader()->setDefaultSectionSize(22);
     m_resultView->setContextMenuPolicy(Qt::CustomContextMenu);
 
     QHeaderView *header = m_resultView->horizontalHeader();
@@ -296,6 +314,15 @@ void FindFasterWidget::buildUi()
     m_progressiveRenderTimer = new QTimer(this);
     m_progressiveRenderTimer->setInterval(0);
     m_progressiveRenderTimer->setSingleShot(false);
+    m_statusUpdateTimer = new QTimer(this);
+    m_statusUpdateTimer->setInterval(100);
+    m_statusUpdateTimer->setSingleShot(true);
+    m_resumeIconsTimer = new QTimer(this);
+    m_resumeIconsTimer->setInterval(700);
+    m_resumeIconsTimer->setSingleShot(true);
+    m_iconRefreshTimer = new QTimer(this);
+    m_iconRefreshTimer->setInterval(kIconRefreshIntervalMs);
+    m_iconRefreshTimer->setSingleShot(false);
 
     m_mainSearchWatcher = new QFutureWatcher<FinderSearchJob>(this);
     m_pageSearchWatcher = new QFutureWatcher<FinderSearchJob>(this);
@@ -311,6 +338,38 @@ void FindFasterWidget::buildUi()
     connect(m_resultView->verticalScrollBar(), &QScrollBar::valueChanged, this, &FindFasterWidget::onScrollLoadMoreDebounce);
     connect(m_resultView, &QTableView::customContextMenuRequested, this, &FindFasterWidget::onResultContextMenu);
     connect(m_progressiveRenderTimer, &QTimer::timeout, this, &FindFasterWidget::onProgressiveRenderTick);
+    connect(m_statusUpdateTimer, &QTimer::timeout, this, [this]() {
+        const bool shouldRender = m_statusUpdatePending;
+        m_statusUpdatePending = false;
+        if (shouldRender) {
+            renderStatusTextNow();
+        }
+    });
+    connect(m_resumeIconsTimer, &QTimer::timeout, this, [this]() {
+        if (m_resultModel) {
+            m_resultModel->setShowIcons(true);
+            m_iconRefreshNextRow = 0;
+            if (m_resultModel->rowCount() > 0 && m_iconRefreshTimer) {
+                m_iconRefreshTimer->start();
+            }
+        }
+    });
+    connect(m_iconRefreshTimer, &QTimer::timeout, this, [this]() {
+        if (!m_resultModel || !m_resultModel->showIcons()) {
+            m_iconRefreshTimer->stop();
+            return;
+        }
+        const int rows = m_resultModel->rowCount();
+        if (rows <= 0 || m_iconRefreshNextRow >= rows) {
+            m_iconRefreshTimer->stop();
+            return;
+        }
+
+        const int first = m_iconRefreshNextRow;
+        const int last = qMin(rows - 1, first + kIconRefreshChunkRows - 1);
+        m_resultModel->notifyDecorationRowsChanged(first, last);
+        m_iconRefreshNextRow = last + 1;
+    });
 }
 
 void FindFasterWidget::buildMenus()
@@ -474,6 +533,7 @@ void FindFasterWidget::applyDisplayResults()
 
     const QString driveFilter = m_driveFilterCombo->currentData().toString();
     if (driveFilter.isEmpty()) {
+        scheduleIconResume();
         if (!m_progressiveRenderTimer->isActive() && m_displayedSearchResults.size() != m_allSearchResults.size()) {
             const int firstRow = m_displayedSearchResults.size();
             m_displayedSearchResults.reserve(m_allSearchResults.size());
@@ -504,6 +564,7 @@ void FindFasterWidget::applyDisplayResults()
         }
     }
     m_resultModel->setOwnedRows(std::move(filtered));
+    scheduleIconResume();
     m_lastApplyDisplayMs = elapsed.elapsed();
 }
 
@@ -575,6 +636,27 @@ QString FindFasterWidget::runtimeMetricsText() const
     }
     parts << QStringLiteral("分块 %1行").arg(m_renderChunkRows);
     return QStringLiteral(" | 运行埋点: %1").arg(parts.join(QStringLiteral(", ")));
+}
+
+void FindFasterWidget::scheduleIconResume()
+{
+    if (!m_resultModel) {
+        return;
+    }
+    if (m_iconRefreshTimer) {
+        m_iconRefreshTimer->stop();
+    }
+    m_iconRefreshNextRow = 0;
+    m_resultModel->setShowIcons(false);
+    if (m_resumeIconsTimer) {
+        m_resumeIconsTimer->stop();
+        m_resumeIconsTimer->start();
+    } else {
+        m_resultModel->setShowIcons(true);
+        if (m_iconRefreshTimer && m_resultModel->rowCount() > 0) {
+            m_iconRefreshTimer->start();
+        }
+    }
 }
 
 void FindFasterWidget::adaptRenderChunkRows()
@@ -765,6 +847,23 @@ void FindFasterWidget::onDriveFilterChanged(int index)
 
 void FindFasterWidget::onScrollLoadMoreDebounce()
 {
+    if (m_resultView) {
+        const int viewportTop = m_resultView->rowAt(0);
+        const int viewportBottom = m_resultView->rowAt(m_resultView->viewport()->height() - 1);
+        if (viewportTop >= 0 && viewportBottom >= 0) {
+            m_viewportAnchorRow = (viewportTop + viewportBottom) / 2;
+        } else if (m_resultView->verticalScrollBar()) {
+            QScrollBar *bar = m_resultView->verticalScrollBar();
+            if (bar->maximum() > 0 && !m_allSearchResults.isEmpty()) {
+                const double ratio = static_cast<double>(bar->value()) / static_cast<double>(bar->maximum());
+                m_viewportAnchorRow = static_cast<int>(ratio * qMax(0, m_allSearchResults.size() - 1));
+            }
+        }
+        if (m_progressiveRenderTimer && !m_progressiveRenderTimer->isActive()
+            && m_progressiveNextIndex < m_allSearchResults.size()) {
+            m_progressiveRenderTimer->start();
+        }
+    }
     if (!m_loadMoreDebounceTimer->isActive()) {
         m_loadMoreDebounceTimer->start();
     }
@@ -1088,10 +1187,12 @@ void FindFasterWidget::startProgressiveDisplay()
     if (m_progressiveRenderTimer->isActive()) {
         m_progressiveRenderTimer->stop();
     }
+    scheduleIconResume();
 
     if (m_allSearchResults.size() <= kFastFullAttachRows) {
         m_displayedSearchResults = m_allSearchResults;
         m_progressiveNextIndex = m_displayedSearchResults.size();
+        m_viewportAnchorRow = 0;
         m_resultModel->setExternalSource(&m_displayedSearchResults);
         m_lastApplyDisplayMs = elapsed.elapsed();
         return;
@@ -1107,6 +1208,7 @@ void FindFasterWidget::startProgressiveDisplay()
         }
     }
     m_progressiveNextIndex = firstPaintCount;
+    m_viewportAnchorRow = 0;
     m_resultModel->setExternalSource(&m_displayedSearchResults);
     m_lastApplyDisplayMs = elapsed.elapsed();
 
@@ -1196,7 +1298,27 @@ void FindFasterWidget::onProgressiveRenderTick()
     }
 
     const int firstRow = m_displayedSearchResults.size();
-    const int nextEnd = qMin(m_progressiveNextIndex + m_renderChunkRows, m_allSearchResults.size());
+
+    int viewportTop = -1;
+    int viewportBottom = -1;
+    int targetEnd = m_progressiveNextIndex + m_renderChunkRows;
+    if (m_resultView) {
+        viewportTop = m_resultView->rowAt(0);
+        viewportBottom = m_resultView->rowAt(m_resultView->viewport()->height() - 1);
+        if (viewportBottom >= 0) {
+            targetEnd = qMax(targetEnd, viewportBottom + kViewportAheadRows);
+        }
+    }
+    if (viewportTop >= 0) {
+        // 上方回补 + 下方预取：优先保证视口上下缓冲区可用，来回拖动更平滑。
+        const int lowerTarget = viewportBottom + kViewportPrefetchRows;
+        const int upperTarget = qMax(0, viewportTop - kViewportBackfillRows);
+        targetEnd = qMax(targetEnd, lowerTarget);
+        targetEnd = qMax(targetEnd, upperTarget + kViewportBackfillRows + kViewportPrefetchRows);
+    } else if (m_viewportAnchorRow > 0) {
+        targetEnd = qMax(targetEnd, m_viewportAnchorRow + kViewportPrefetchRows);
+    }
+    const int nextEnd = qMin(targetEnd, m_allSearchResults.size());
     for (int i = m_progressiveNextIndex; i < nextEnd; ++i) {
         m_displayedSearchResults.push_back(m_allSearchResults.at(i));
     }

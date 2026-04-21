@@ -76,18 +76,37 @@ QVariant FinderResultsModel::data(const QModelIndex &index, int role) const
             return row.entry.name;
         case 1:
             return row.entry.path;
-        case 2:
-            return formatFileSize(row.entry.sizeBytes);
-        case 3:
-            return row.entry.lastModified.isValid()
+        case 2: {
+            const QString cacheKey = path;
+            const auto it = m_sizeTextCache.constFind(cacheKey);
+            if (it != m_sizeTextCache.constEnd()) {
+                return it.value();
+            }
+            const QString sizeText = formatFileSize(row.entry.sizeBytes);
+            m_sizeTextCache.insert(cacheKey, sizeText);
+            return sizeText;
+        }
+        case 3: {
+            const QString cacheKey = path;
+            const auto it = m_timeTextCache.constFind(cacheKey);
+            if (it != m_timeTextCache.constEnd()) {
+                return it.value();
+            }
+            const QString timeText = row.entry.lastModified.isValid()
                     ? row.entry.lastModified.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))
                     : QStringLiteral("-");
+            m_timeTextCache.insert(cacheKey, timeText);
+            return timeText;
+        }
         default:
             return QVariant();
         }
     }
 
     if (role == Qt::DecorationRole && index.column() == 0) {
+        if (!m_showIcons) {
+            return QVariant();
+        }
         static QFileIconProvider iconProvider;
         const QFileInfo info(path);
         const QString suffix = info.suffix().toLower();
@@ -175,12 +194,50 @@ void FinderResultsModel::notifyExternalRowsInserted(int firstRow, int lastRowInc
     endInsertRows();
 }
 
+void FinderResultsModel::notifyDecorationRowsChanged(int firstRow, int lastRowInclusive)
+{
+    if (firstRow > lastRowInclusive || firstRow < 0) {
+        return;
+    }
+    const int rows = rowCount();
+    if (rows <= 0 || firstRow >= rows) {
+        return;
+    }
+    const int last = qMin(lastRowInclusive, rows - 1);
+    const QModelIndex topLeft = index(firstRow, 0);
+    const QModelIndex bottomRight = index(last, 0);
+    emit dataChanged(topLeft, bottomRight, {Qt::DecorationRole});
+}
+
 bool FinderResultsModel::isUsingExternalSource(const QList<FinderSearchResult> *source) const
 {
     if (!m_externalSource) {
         return false;
     }
     return !source || m_externalSource == source;
+}
+
+void FinderResultsModel::setShowIcons(bool enabled)
+{
+    if (m_showIcons == enabled) {
+        return;
+    }
+    m_showIcons = enabled;
+    // 关闭图标时立即清空装饰；开启图标由外部分批触发装饰刷新，避免一次性卡顿。
+    if (!m_showIcons) {
+        const int rows = rowCount();
+        if (rows <= 0) {
+            return;
+        }
+        const QModelIndex topLeft = index(0, 0);
+        const QModelIndex bottomRight = index(rows - 1, 0);
+        emit dataChanged(topLeft, bottomRight, {Qt::DecorationRole});
+    }
+}
+
+bool FinderResultsModel::showIcons() const
+{
+    return m_showIcons;
 }
 
 QString FinderResultsModel::pathAtRow(int row) const
