@@ -24,6 +24,7 @@ public:
     void setOwnedRows(QList<FinderSearchResult> &&rows);
     void clearResults();
     void notifyExternalRowsInserted(int firstRow, int lastRowInclusive);
+    bool isUsingExternalSource(const QList<FinderSearchResult> *source = nullptr) const;
 
     QString pathAtRow(int row) const;
     const FinderSearchResult &resultAt(int row) const;

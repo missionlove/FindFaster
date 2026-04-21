@@ -27,6 +27,7 @@ struct FinderSearchJob
     int token = 0;
     bool forDisplay = true;
     QString keyword;
+    qint64 searchMs = -1;
     FinderSearchOutcome outcome;
 };
 
@@ -62,7 +63,10 @@ private:
     static constexpr int kInitialDisplayPageSize = 3000;
     static constexpr int kFirstFramePageSize = 400;
     static constexpr int kFirstPaintRows = 50;
-    static constexpr int kRenderChunkRows = 200;
+    static constexpr int kFastFullAttachRows = 80000;
+    static constexpr int kRenderChunkRowsDefault = 200;
+    static constexpr int kRenderChunkRowsMin = 80;
+    static constexpr int kRenderChunkRowsMax = 1200;
     static constexpr int kStableHeadRows = 20;
     void buildUi();
     void buildMenus();
@@ -72,6 +76,8 @@ private:
     void beginSearchNow(const FinderSearchRequest &request, bool forDisplay);
     void maybeContinueInitialWarmup();
     QString startupMetricsText() const;
+    QString runtimeMetricsText() const;
+    void adaptRenderChunkRows();
     void logStartupMetricsIfReady();
     void applyDisplayResults();
     void startLoadNextPage();
@@ -126,5 +132,8 @@ private:
     qint64 m_previewCommitMs = -1;
     qint64 m_fullDecodeMs = -1;
     qint64 m_firstVisibleMs = -1;
+    qint64 m_lastSearchComputeMs = -1;
+    qint64 m_lastApplyDisplayMs = -1;
+    int m_renderChunkRows = kRenderChunkRowsDefault;
 };
 #endif // FINDFASTERWIDGET_H

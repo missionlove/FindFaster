@@ -2,6 +2,7 @@
 #include "ntfsusn_utils.h"
 
 #include <QtConcurrent/QtConcurrent>
+#include <QBuffer>
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDataStream>
@@ -9,19 +10,24 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QSaveFile>
 #include <QFileSystemWatcher>
 #include <QFuture>
 #include <QFutureWatcher>
 #include <QHash>
+#include <QMutex>
 #include <QReadWriteLock>
 #include <QSet>
 #include <QStandardPaths>
 #include <QStorageInfo>
+#include <QThread>
 #include <QTimer>
 #include <QVector>
 #include <algorithm>
 #include <atomic>
 #include <climits>
+#include <memory>
+#include <queue>
 #include <utility>
 
 #ifdef Q_OS_WIN
@@ -184,6 +190,7 @@ QStringList tokenizeName(const QString &nameLower)
 void buildDerivedIndexesFromRecords(const QHash<QString, FinderIndexedRecord> &recordsByPath,
                                     QVector<FinderIndexedRecord> *recordsLinear,
                                     QHash<QString, QVector<int>> *nameInverted,
+                                    QHash<QString, QVector<int>> *pathInverted,
                                     QVector<int> *allRecordIndexes)
 {
     if (!recordsLinear || !nameInverted || !allRecordIndexes) {
@@ -192,6 +199,9 @@ void buildDerivedIndexesFromRecords(const QHash<QString, FinderIndexedRecord> &r
 
     recordsLinear->clear();
     nameInverted->clear();
+    if (pathInverted) {
+        pathInverted->clear();
+    }
     allRecordIndexes->clear();
 
     recordsLinear->reserve(recordsByPath.size());
@@ -213,11 +223,63 @@ void buildDerivedIndexesFromRecords(const QHash<QString, FinderIndexedRecord> &r
         recordsLinear->push_back(record);
         allRecordIndexes->push_back(index);
 
-        const QStringList tokens = tokenizeName(record.nameLower);
-        for (const QString &token : tokens) {
+        const QStringList nameTokens = tokenizeName(record.nameLower);
+        for (const QString &token : nameTokens) {
             (*nameInverted)[token].push_back(index);
         }
+        if (pathInverted) {
+            const QStringList pathTokens = tokenizeName(record.pathLower);
+            for (const QString &token : pathTokens) {
+                (*pathInverted)[token].push_back(index);
+            }
+        }
         ++index;
+    }
+
+    for (auto it = nameInverted->begin(); it != nameInverted->end(); ++it) {
+        it.value().squeeze();
+    }
+    if (pathInverted) {
+        for (auto it = pathInverted->begin(); it != pathInverted->end(); ++it) {
+            it.value().squeeze();
+        }
+    }
+}
+
+void buildInvertedIndexesFromLinear(const QVector<FinderIndexedRecord> &recordsLinear,
+                                    const QVector<int> &allRecordIndexes,
+                                    QHash<QString, QVector<int>> *nameInverted,
+                                    QHash<QString, QVector<int>> *pathInverted)
+{
+    if (!nameInverted || !pathInverted) {
+        return;
+    }
+    nameInverted->clear();
+    pathInverted->clear();
+
+    for (int rawIndex : allRecordIndexes) {
+        if (rawIndex < 0 || rawIndex >= recordsLinear.size()) {
+            continue;
+        }
+        const FinderIndexedRecord &record = recordsLinear.at(rawIndex);
+        const QString nameLower = record.nameLower.isEmpty() ? record.entry.name.toLower() : record.nameLower;
+        const QString pathLower = record.pathLower.isEmpty() ? record.entry.path.toLower() : record.pathLower;
+
+        const QStringList nameTokens = tokenizeName(nameLower);
+        for (const QString &token : nameTokens) {
+            (*nameInverted)[token].push_back(rawIndex);
+        }
+        const QStringList pathTokens = tokenizeName(pathLower);
+        for (const QString &token : pathTokens) {
+            (*pathInverted)[token].push_back(rawIndex);
+        }
+    }
+
+    for (auto it = nameInverted->begin(); it != nameInverted->end(); ++it) {
+        it.value().squeeze();
+    }
+    for (auto it = pathInverted->begin(); it != pathInverted->end(); ++it) {
+        it.value().squeeze();
     }
 }
 
@@ -1043,37 +1105,79 @@ public:
                 ? request.keyword.toLower()
                 : request.keyword;
 
-        std::sort(indexes.begin(), indexes.end(), [&](int a, int b) {
-            const FinderSearchResult left = makeResult(records.at(a), keyword);
-            const FinderSearchResult right = makeResult(records.at(b), keyword);
-            if (left.score != right.score) {
-                return left.score > right.score;
-            }
-            if (left.entry.name.length() != right.entry.name.length()) {
-                return left.entry.name.length() < right.entry.name.length();
-            }
-            return left.entry.path < right.entry.path;
-        });
+        struct SortRow
+        {
+            int recordIndex = 0;
+            int score = 0;
+            int nameLen = 0;
+            QString path;
+        };
 
         const int limit = request.limit > 0 ? request.limit : indexes.size();
-        const int size = std::min(limit, indexes.size());
+        const auto better = [](const SortRow &a, const SortRow &b) {
+            if (a.score != b.score) {
+                return a.score > b.score;
+            }
+            if (a.nameLen != b.nameLen) {
+                return a.nameLen < b.nameLen;
+            }
+            return a.path < b.path;
+        };
+
+        QVector<SortRow> rows;
+        if (limit > 0 && limit < indexes.size()) {
+            // Top-K heap: keep the current K best rows; heap top is the worst among them.
+            std::priority_queue<SortRow, std::vector<SortRow>, decltype(better)> topK(better);
+            for (int recordIndex : indexes) {
+                const FinderIndexedRecord &rec = records.at(recordIndex);
+                SortRow row;
+                row.recordIndex = recordIndex;
+                row.score = score(rec, keyword, request.fileNamesOnly);
+                row.nameLen = rec.entry.name.length();
+                row.path = rec.entry.path;
+
+                if (topK.size() < static_cast<size_t>(limit)) {
+                    topK.push(std::move(row));
+                    continue;
+                }
+                if (better(row, topK.top())) {
+                    topK.pop();
+                    topK.push(std::move(row));
+                }
+            }
+            rows.reserve(static_cast<int>(topK.size()));
+            while (!topK.empty()) {
+                rows.push_back(std::move(topK.top()));
+                topK.pop();
+            }
+            std::sort(rows.begin(), rows.end(), better);
+        } else {
+            rows.reserve(indexes.size());
+            for (int recordIndex : indexes) {
+                const FinderIndexedRecord &rec = records.at(recordIndex);
+                SortRow row;
+                row.recordIndex = recordIndex;
+                row.score = score(rec, keyword, request.fileNamesOnly);
+                row.nameLen = rec.entry.name.length();
+                row.path = rec.entry.path;
+                rows.push_back(std::move(row));
+            }
+            std::sort(rows.begin(), rows.end(), better);
+        }
+
+        const int size = qMin(limit, rows.size());
         results.reserve(size);
         for (int i = 0; i < size; ++i) {
-            results.push_back(makeResult(records.at(indexes.at(i)), keyword));
+            FinderSearchResult item;
+            item.entry = records.at(rows.at(i).recordIndex).entry;
+            item.score = rows.at(i).score;
+            results.push_back(std::move(item));
         }
         return results;
     }
 
 private:
-    FinderSearchResult makeResult(const FinderIndexedRecord &record, const QString &keyword) const
-    {
-        FinderSearchResult result;
-        result.entry = record.entry;
-        result.score = score(record, keyword);
-        return result;
-    }
-
-    int score(const FinderIndexedRecord &record, const QString &keyword) const
+    int score(const FinderIndexedRecord &record, const QString &keyword, bool fileNamesOnly) const
     {
         if (keyword.isEmpty()) {
             return 10;
@@ -1091,7 +1195,7 @@ private:
         if (lowerName.contains(keyword)) {
             return 400;
         }
-        if (lowerPath.contains(keyword)) {
+        if (!fileNamesOnly && lowerPath.contains(keyword)) {
             return 200;
         }
         return 0;
@@ -1253,6 +1357,7 @@ FinderIndexBuildOutcome decodePersistedIndexImpl(const QString &path,
     out.recordsLinear = std::move(linear);
     out.allRecordIndexes = std::move(indexes);
     out.nameInverted.clear();
+    out.pathInverted.clear();
     out.lastIndexOptions.roots = roots;
     out.lastIndexOptions.excludes = excludes;
     out.lastIndexOptions.includeHidden = includeHidden;
@@ -1319,7 +1424,7 @@ FinderIndexBuildOutcome buildIndexDatasetImpl(const FinderIndexOptions &options,
     }
 
     out.recordsByPath = std::move(records);
-    buildDerivedIndexesFromRecords(out.recordsByPath, &out.recordsLinear, &out.nameInverted, &out.allRecordIndexes);
+    buildDerivedIndexesFromRecords(out.recordsByPath, &out.recordsLinear, &out.nameInverted, &out.pathInverted, &out.allRecordIndexes);
     out.stats = stats;
     out.loadedFromPersistence = false;
     out.partialData = false;
@@ -1351,11 +1456,27 @@ bool finderPersistentIndexNeedsRebuild(const FinderIndexBuildOutcome &decoded,
     return persistentNeedsRebuildImpl(decoded, requestedDesired);
 }
 
+struct SearchIndexSnapshot
+{
+    QVector<FinderIndexedRecord> recordsLinear;
+    QVector<int> allRecordIndexes;
+    QHash<QString, QVector<int>> nameInverted;
+    QHash<QString, QVector<int>> pathInverted;
+};
+
+struct DeferredInvertedBuildResult
+{
+    QHash<QString, QVector<int>> nameInverted;
+    QHash<QString, QVector<int>> pathInverted;
+    bool ok = false;
+};
+
 struct Libfinder::Impl
 {
     QHash<QString, FinderIndexedRecord> recordsByPath;
     QVector<FinderIndexedRecord> recordsLinear;
     QHash<QString, QVector<int>> nameInverted;
+    QHash<QString, QVector<int>> pathInverted;
     QVector<int> allRecordIndexes;
     FinderIndexStats stats;
     FinderIndexOptions lastIndexOptions;
@@ -1369,19 +1490,47 @@ struct Libfinder::Impl
     QTimer *watchDebounceTimer = nullptr;
     QTimer *usnPollTimer = nullptr;
     QFutureWatcher<QStringList> *watchDirectoryBuildWatcher = nullptr;
+    QTimer *persistDebounceTimer = nullptr;
+    QFutureWatcher<bool> *persistWriteWatcher = nullptr;
+    QTimer *deferredInvertedBuildTimer = nullptr;
+    QFutureWatcher<DeferredInvertedBuildResult> *deferredInvertedBuildWatcher = nullptr;
+    bool deferredInvertedBuildPending = false;
+    quint64 deferredInvertedBuildRevision = 0;
+    quint64 runningDeferredInvertedBuildRevision = 0;
+    int deferredInvertedBuildDelayMs = 1500;
+    bool persistDirty = false;
+    bool persistCoalesceAfterSave = false;
+    int persistDebounceMs = 3000;
+    bool persistAsyncWriteEnabled = true;
     QSet<QString> pendingChangedDirectories;
     FinderIndexOptions pendingWatchOptions;
     bool hasPendingWatchOptions = false;
     int watchBuildRevision = 0;
     int runningWatchBuildRevision = 0;
     QReadWriteLock lock;
+    mutable QMutex searchSnapshotMutex;
+    std::shared_ptr<const SearchIndexSnapshot> searchSnapshot;
+
+    void refreshSearchSnapshot()
+    {
+        auto snap = std::make_shared<SearchIndexSnapshot>();
+        snap->recordsLinear = recordsLinear;
+        snap->allRecordIndexes = allRecordIndexes;
+        snap->nameInverted = nameInverted;
+        snap->pathInverted = pathInverted;
+        QMutexLocker locker(&searchSnapshotMutex);
+        searchSnapshot = std::move(snap);
+    }
 
     void clearWatchedDirectories()
     {
         if (!watcher) {
             return;
         }
-        watcher->removePaths(watcher->directories());
+        const QStringList dirs = watcher->directories();
+        if (!dirs.isEmpty()) {
+            watcher->removePaths(dirs);
+        }
     }
 
     void startPendingWatchDirectoryRefresh()
@@ -1441,9 +1590,215 @@ struct Libfinder::Impl
 
     void rebuildDerivedIndexes()
     {
-        buildDerivedIndexesFromRecords(recordsByPath, &recordsLinear, &nameInverted, &allRecordIndexes);
+        if (deferredInvertedBuildTimer) {
+            deferredInvertedBuildTimer->stop();
+        }
+        deferredInvertedBuildPending = false;
+        ++deferredInvertedBuildRevision;
+        buildDerivedIndexesFromRecords(recordsByPath, &recordsLinear, &nameInverted, &pathInverted, &allRecordIndexes);
+        refreshSearchSnapshot();
     }
+
+    /// 调用方须已持有 `lock` 的读锁（或写锁）；仅访问本结构成员。
+    bool serializePersistedToBuffer(QByteArray *out, QString *errorMessage) const;
 };
+
+bool Libfinder::Impl::serializePersistedToBuffer(QByteArray *out, QString *errorMessage) const
+{
+    if (!out) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Internal error: invalid serialization target.");
+        }
+        return false;
+    }
+
+    QFileInfo fileInfo(persistencePath);
+    QDir targetDir = fileInfo.dir();
+    if (!targetDir.exists() && !targetDir.mkpath(QStringLiteral("."))) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Cannot create index directory.");
+        }
+        return false;
+    }
+
+    QBuffer buffer(out);
+    if (!buffer.open(QIODevice::WriteOnly)) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Cannot allocate index buffer.");
+        }
+        return false;
+    }
+
+    QDataStream stream(&buffer);
+    const quint32 version = 3;
+    const quint32 recordCount = static_cast<quint32>(recordsByPath.size());
+    const qint64 indexedAtMs = stats.indexedAt.toMSecsSinceEpoch();
+    const qint32 backendValue = static_cast<qint32>(lastIndexOptions.backend);
+    const qint64 channelUpdatedAtMs = stats.channelUpdatedAt.toMSecsSinceEpoch();
+
+    stream << version
+           << recordCount
+           << lastIndexOptions.roots
+           << lastIndexOptions.excludes
+           << lastIndexOptions.includeHidden
+           << lastIndexOptions.maxFiles
+           << backendValue
+           << indexedAtMs
+           << stats.channelState
+           << stats.channelDetail
+           << channelUpdatedAtMs
+           << stats.usnParsedRecords
+           << stats.usnErrorCount;
+
+    for (auto it = recordsByPath.constBegin(); it != recordsByPath.constEnd(); ++it) {
+        const FinderIndexedRecord &record = it.value();
+        stream << record.entry.name
+               << record.entry.path
+               << record.entry.sizeBytes
+               << record.entry.lastModified.toMSecsSinceEpoch();
+    }
+
+    if (stream.status() != QDataStream::Ok) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Persisted index encode failed.");
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool writeIndexBytesWithSaveFile(const QString &persistencePath, QByteArray bytes, QString *errorMessage)
+{
+    QSaveFile file(persistencePath);
+    if (!file.open(QIODevice::WriteOnly)) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Cannot write persisted index file.");
+        }
+        return false;
+    }
+    if (file.write(bytes) != bytes.size()) {
+        file.cancelWriting();
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Persisted index write incomplete.");
+        }
+        return false;
+    }
+    if (!file.commit()) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Persisted index commit failed.");
+        }
+        return false;
+    }
+    return true;
+}
+
+static int autoDeferredInvertedBuildDelayMs()
+{
+    const int cores = qMax(1, QThread::idealThreadCount());
+    quint64 ramGiB = 8;
+#ifdef Q_OS_WIN
+    MEMORYSTATUSEX memStatus;
+    ZeroMemory(&memStatus, sizeof(memStatus));
+    memStatus.dwLength = sizeof(memStatus);
+    if (GlobalMemoryStatusEx(&memStatus)) {
+        ramGiB = static_cast<quint64>(memStatus.ullTotalPhys / (1024ull * 1024ull * 1024ull));
+    }
+#endif
+
+    if (cores >= 16 && ramGiB >= 32) {
+        return 700;
+    }
+    if (cores >= 8 && ramGiB >= 16) {
+        return 1000;
+    }
+    if (cores >= 6 && ramGiB >= 8) {
+        return 1300;
+    }
+    if (cores <= 2 || ramGiB < 4) {
+        return 2200;
+    }
+    return 1600;
+}
+
+void Libfinder::waitForAsyncPersistFinished()
+{
+    if (!d->persistWriteWatcher) {
+        return;
+    }
+    if (d->persistWriteWatcher->isRunning()) {
+        d->persistWriteWatcher->waitForFinished();
+    }
+}
+
+void Libfinder::schedulePersistedIndexSave()
+{
+    int debounceMs = 0;
+    {
+        QWriteLocker locker(&d->lock);
+        d->persistDirty = true;
+        debounceMs = d->persistDebounceMs;
+    }
+    if (debounceMs <= 0) {
+        flushDebouncedPersistSave();
+        return;
+    }
+    if (d->persistDebounceTimer) {
+        d->persistDebounceTimer->setInterval(debounceMs);
+        d->persistDebounceTimer->stop();
+        d->persistDebounceTimer->start();
+    }
+}
+
+void Libfinder::cancelDebouncedPersistedIndexSave()
+{
+    if (d->persistDebounceTimer) {
+        d->persistDebounceTimer->stop();
+    }
+    waitForAsyncPersistFinished();
+    QWriteLocker locker(&d->lock);
+    d->persistDirty = false;
+    d->persistCoalesceAfterSave = false;
+}
+
+void Libfinder::flushDebouncedPersistSave()
+{
+    if (!d->persistAsyncWriteEnabled) {
+        QString err;
+        if (savePersistedIndex(&err)) {
+            QWriteLocker locker(&d->lock);
+            d->persistDirty = false;
+        }
+        return;
+    }
+    startAsyncPersistWrite();
+}
+
+void Libfinder::startAsyncPersistWrite()
+{
+    if (d->persistWriteWatcher->isRunning()) {
+        QWriteLocker locker(&d->lock);
+        d->persistCoalesceAfterSave = true;
+        return;
+    }
+
+    QByteArray blob;
+    QString pathCopy;
+    {
+        QReadLocker locker(&d->lock);
+        pathCopy = d->persistencePath;
+        QString serErr;
+        if (!d->serializePersistedToBuffer(&blob, &serErr)) {
+            Q_UNUSED(serErr);
+            return;
+        }
+    }
+
+    QFuture<bool> future = QtConcurrent::run([pathCopy, blob]() mutable {
+        QString writeErr;
+        return writeIndexBytesWithSaveFile(pathCopy, std::move(blob), &writeErr);
+    });
+    d->persistWriteWatcher->setFuture(future);
+}
 
 Libfinder::Libfinder()
     : d(new Impl)
@@ -1453,6 +1808,7 @@ Libfinder::Libfinder()
         basePath = QDir::homePath() + QStringLiteral("/.findfast");
     }
     d->persistencePath = QDir::cleanPath(basePath + QStringLiteral("/findfast.index.bin"));
+    d->refreshSearchSnapshot();
 
     d->watcher = new QFileSystemWatcher();
     d->watchDebounceTimer = new QTimer();
@@ -1461,7 +1817,96 @@ Libfinder::Libfinder()
     d->usnPollTimer = new QTimer();
     d->usnPollTimer->setInterval(1000);
     d->usnPollTimer->setSingleShot(false);
+    d->persistDebounceTimer = new QTimer();
+    d->persistDebounceTimer->setInterval(d->persistDebounceMs);
+    d->persistDebounceTimer->setSingleShot(true);
+    d->persistWriteWatcher = new QFutureWatcher<bool>();
+    d->deferredInvertedBuildDelayMs = autoDeferredInvertedBuildDelayMs();
+    d->deferredInvertedBuildTimer = new QTimer();
+    d->deferredInvertedBuildTimer->setInterval(d->deferredInvertedBuildDelayMs);
+    d->deferredInvertedBuildTimer->setSingleShot(true);
+    d->deferredInvertedBuildWatcher = new QFutureWatcher<DeferredInvertedBuildResult>();
     d->watchDirectoryBuildWatcher = new QFutureWatcher<QStringList>();
+
+    QObject::connect(d->persistWriteWatcher, &QFutureWatcher<bool>::finished, [this]() {
+        const bool ok = d->persistWriteWatcher->result();
+        bool needReschedule = false;
+        {
+            QWriteLocker locker(&d->lock);
+            if (ok) {
+                d->persistDirty = false;
+            }
+            if (d->persistCoalesceAfterSave) {
+                d->persistCoalesceAfterSave = false;
+                needReschedule = true;
+            }
+        }
+        if (needReschedule) {
+            schedulePersistedIndexSave();
+        }
+    });
+
+    QObject::connect(d->persistDebounceTimer, &QTimer::timeout, [this]() {
+        flushDebouncedPersistSave();
+    });
+
+    QObject::connect(d->deferredInvertedBuildTimer, &QTimer::timeout, [this]() {
+        QVector<FinderIndexedRecord> linearCopy;
+        QVector<int> indexCopy;
+        quint64 revision = 0;
+        {
+            QReadLocker locker(&d->lock);
+            if (!d->deferredInvertedBuildPending || d->deferredInvertedBuildWatcher->isRunning()) {
+                return;
+            }
+            linearCopy = d->recordsLinear;
+            indexCopy = d->allRecordIndexes;
+            revision = d->deferredInvertedBuildRevision;
+        }
+        if (linearCopy.isEmpty() || indexCopy.isEmpty()) {
+            return;
+        }
+        {
+            QWriteLocker locker(&d->lock);
+            if (!d->deferredInvertedBuildPending
+                || d->deferredInvertedBuildWatcher->isRunning()
+                || revision != d->deferredInvertedBuildRevision) {
+                return;
+            }
+            d->deferredInvertedBuildPending = false;
+            d->runningDeferredInvertedBuildRevision = revision;
+        }
+
+        QFuture<DeferredInvertedBuildResult> future = QtConcurrent::run([linearCopy, indexCopy]() mutable {
+            DeferredInvertedBuildResult result;
+            buildInvertedIndexesFromLinear(linearCopy, indexCopy, &result.nameInverted, &result.pathInverted);
+            result.ok = !result.nameInverted.isEmpty() || !result.pathInverted.isEmpty();
+            return result;
+        });
+        d->deferredInvertedBuildWatcher->setFuture(future);
+    });
+
+    QObject::connect(d->deferredInvertedBuildWatcher, &QFutureWatcher<DeferredInvertedBuildResult>::finished, [this]() {
+        const DeferredInvertedBuildResult built = d->deferredInvertedBuildWatcher->result();
+        bool shouldRestart = false;
+        {
+            QWriteLocker locker(&d->lock);
+            const bool fresh = d->runningDeferredInvertedBuildRevision != 0
+                    && d->runningDeferredInvertedBuildRevision == d->deferredInvertedBuildRevision;
+            if (fresh && built.ok) {
+                d->nameInverted = built.nameInverted;
+                d->pathInverted = built.pathInverted;
+                d->refreshSearchSnapshot();
+                d->cache.clear();
+            }
+            d->runningDeferredInvertedBuildRevision = 0;
+            shouldRestart = d->deferredInvertedBuildPending;
+        }
+        if (shouldRestart && d->deferredInvertedBuildTimer) {
+            d->deferredInvertedBuildTimer->stop();
+            d->deferredInvertedBuildTimer->start();
+        }
+    });
 
     QObject::connect(d->watcher, &QFileSystemWatcher::directoryChanged, [this](const QString &path) {
         if (d->activeBackend != FinderIndexOptions::Backend::Generic) {
@@ -1489,12 +1934,15 @@ Libfinder::Libfinder()
             setChannelStatus(&d->stats, QStringLiteral("healthy"), QStringLiteral("watcher-incremental"));
             d->cache.clear();
         }
-        d->watcher->removePaths(d->watcher->directories());
+        const QStringList existingWatchDirs = d->watcher->directories();
+        if (!existingWatchDirs.isEmpty()) {
+            d->watcher->removePaths(existingWatchDirs);
+        }
         const QStringList watchDirs = enumerateWatchDirectories(d->lastIndexOptions);
         if (!watchDirs.isEmpty()) {
             d->watcher->addPaths(watchDirs);
         }
-        savePersistedIndex();
+        schedulePersistedIndexSave();
     });
     QObject::connect(d->watchDirectoryBuildWatcher, &QFutureWatcher<QStringList>::finished, [this]() {
         d->onWatchDirectoryRefreshFinished();
@@ -1529,7 +1977,7 @@ Libfinder::Libfinder()
         }
 
         if (changed) {
-            savePersistedIndex();
+            schedulePersistedIndexSave();
         }
     });
 }
@@ -1539,10 +1987,36 @@ Libfinder::~Libfinder()
     if (d->usnPollTimer) {
         d->usnPollTimer->stop();
     }
+    if (d->persistDebounceTimer) {
+        d->persistDebounceTimer->stop();
+    }
+    if (d->deferredInvertedBuildTimer) {
+        d->deferredInvertedBuildTimer->stop();
+    }
     if (d->watchDirectoryBuildWatcher && d->watchDirectoryBuildWatcher->isRunning()) {
         d->watchDirectoryBuildWatcher->waitForFinished();
     }
+    if (d->deferredInvertedBuildWatcher && d->deferredInvertedBuildWatcher->isRunning()) {
+        d->deferredInvertedBuildWatcher->waitForFinished();
+    }
+    waitForAsyncPersistFinished();
+    bool dirtyFlush = false;
+    {
+        QReadLocker locker(&d->lock);
+        dirtyFlush = d->persistDirty;
+    }
+    if (dirtyFlush) {
+        QString err;
+        if (savePersistedIndex(&err)) {
+            QWriteLocker locker(&d->lock);
+            d->persistDirty = false;
+        }
+    }
     delete d->watchDirectoryBuildWatcher;
+    delete d->deferredInvertedBuildWatcher;
+    delete d->deferredInvertedBuildTimer;
+    delete d->persistWriteWatcher;
+    delete d->persistDebounceTimer;
     delete d->watchDebounceTimer;
     delete d->usnPollTimer;
     delete d->watcher;
@@ -1558,15 +2032,257 @@ bool Libfinder::rebuildIndex(const FinderIndexOptions &options, QString *errorMe
     return commitIndexBuild(std::move(bundle), errorMessage);
 }
 
+namespace {
+
+static const int kMaxInvertedPostingSpan = 50000;
+
+static bool haystackContainsKey(const QString &haystack, const QString &needle, Qt::CaseSensitivity cs)
+{
+#if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0)
+    return QStringView(haystack).contains(QStringView(needle), cs);
+#else
+    return haystack.contains(needle, cs);
+#endif
+}
+
+static bool invertedTokenAllowed(const QString &token)
+{
+    return token.size() > 1;
+}
+
+static bool recordMatchesKeyword(const FinderIndexedRecord &record,
+                                 const QString &keyword,
+                                 const FinderSearchRequest &request)
+{
+    if (request.fileNamesOnly) {
+        if (request.caseSensitivity == Qt::CaseInsensitive) {
+            const QString nameHay = record.nameLower.isEmpty() ? record.entry.name.toLower() : record.nameLower;
+            return haystackContainsKey(nameHay, keyword, Qt::CaseInsensitive);
+        }
+        return record.entry.name.contains(keyword, request.caseSensitivity);
+    }
+    if (request.caseSensitivity == Qt::CaseInsensitive) {
+        if (!record.searchableText.isEmpty()) {
+            return haystackContainsKey(record.searchableText, keyword, Qt::CaseInsensitive);
+        }
+        const QString nameLower = record.nameLower.isEmpty() ? record.entry.name.toLower() : record.nameLower;
+        const QString pathLower = record.pathLower.isEmpty() ? record.entry.path.toLower() : record.pathLower;
+        const QString haystack = QStringLiteral("%1 %2").arg(nameLower, pathLower);
+        return haystackContainsKey(haystack, keyword, Qt::CaseInsensitive);
+    }
+    const QString haystack = QStringLiteral("%1 %2").arg(record.entry.name, record.entry.path);
+    return haystackContainsKey(haystack, keyword, request.caseSensitivity);
+}
+
+static bool tryBuildInvertedCandidateIndexes(const SearchIndexSnapshot *snap,
+                                             const QString &keyword,
+                                             bool fileNamesOnly,
+                                             bool hasPathLikeChars,
+                                             QVector<int> *outCandidates,
+                                             bool *outUsedInverted)
+{
+    *outUsedInverted = false;
+    if (!snap || fileNamesOnly) {
+        return false;
+    }
+    const QHash<QString, QVector<int>> *inv = hasPathLikeChars ? &snap->pathInverted : &snap->nameInverted;
+    if (inv->isEmpty()) {
+        return false;
+    }
+    const QStringList queryTokens = tokenizeName(keyword);
+    if (queryTokens.isEmpty()) {
+        return false;
+    }
+    struct TokenPostingRef
+    {
+        const QVector<int> *posting = nullptr;
+    };
+    QVector<TokenPostingRef> ordered;
+    ordered.reserve(queryTokens.size());
+    for (const QString &token : queryTokens) {
+        if (!invertedTokenAllowed(token)) {
+            return false;
+        }
+        const auto postingIt = inv->constFind(token);
+        if (postingIt == inv->constEnd()) {
+            return false;
+        }
+        TokenPostingRef ref{&postingIt.value()};
+        ordered.push_back(ref);
+    }
+    std::sort(ordered.begin(), ordered.end(), [](const TokenPostingRef &a, const TokenPostingRef &b) {
+        return a.posting->size() < b.posting->size();
+    });
+    if (!ordered.isEmpty() && ordered.first().posting->size() > kMaxInvertedPostingSpan) {
+        return false;
+    }
+    QVector<int> merged = *ordered.first().posting;
+    for (int ti = 1; ti < ordered.size(); ++ti) {
+        const QVector<int> &posting = *ordered.at(ti).posting;
+        QVector<int> intersection;
+        intersection.reserve(qMin(merged.size(), posting.size()));
+        int i = 0;
+        int j = 0;
+        while (i < merged.size() && j < posting.size()) {
+            if (merged.at(i) == posting.at(j)) {
+                intersection.push_back(merged.at(i));
+                ++i;
+                ++j;
+            } else if (merged.at(i) < posting.at(j)) {
+                ++i;
+            } else {
+                ++j;
+            }
+        }
+        merged = std::move(intersection);
+        if (merged.isEmpty()) {
+            return false;
+        }
+    }
+    if (merged.isEmpty()) {
+        return false;
+    }
+    *outCandidates = std::move(merged);
+    *outUsedInverted = true;
+    return true;
+}
+
+static QVector<FinderIndexedRecord> sequentialScanMatches(const SearchIndexSnapshot &snap,
+                                                         const QVector<int> &scanIndexes,
+                                                         const QString &keyword,
+                                                         const FinderSearchRequest &request,
+                                                         std::atomic<bool> *cancelToken,
+                                                         qint64 *matchedOrdinal,
+                                                         const qint64 skipMatches,
+                                                         const int maxBucket,
+                                                         bool *hasMore,
+                                                         bool *truncated)
+{
+    QVector<FinderIndexedRecord> bucket;
+    bucket.reserve(qMin(maxBucket, 65536));
+    qint64 ord = *matchedOrdinal;
+    int tick = 0;
+    for (int rawIndex : scanIndexes) {
+        if (((++tick) & 511) == 0 && cancelToken && cancelToken->load()) {
+            *truncated = true;
+            break;
+        }
+        if (rawIndex < 0 || rawIndex >= snap.recordsLinear.size()) {
+            continue;
+        }
+        const FinderIndexedRecord &record = snap.recordsLinear.at(rawIndex);
+        if (!recordMatchesKeyword(record, keyword, request)) {
+            continue;
+        }
+        if (ord++ < skipMatches) {
+            continue;
+        }
+        if (bucket.size() >= maxBucket) {
+            *hasMore = true;
+            break;
+        }
+        bucket.push_back(record);
+    }
+    *matchedOrdinal = ord;
+    return bucket;
+}
+
+static QVector<FinderIndexedRecord> parallelScanMatches(const SearchIndexSnapshot &snap,
+                                                        const QVector<int> &scanIndexes,
+                                                        const QString &keyword,
+                                                        const FinderSearchRequest &request,
+                                                        std::atomic<bool> *cancelToken,
+                                                        qint64 *matchedOrdinalInOut,
+                                                        const qint64 skipMatches,
+                                                        const int maxBucket,
+                                                        bool *hasMore,
+                                                        bool *truncated)
+{
+    const int n = scanIndexes.size();
+    if (n < 12000 || cancelToken) {
+        return sequentialScanMatches(snap, scanIndexes, keyword, request, cancelToken,
+                                     matchedOrdinalInOut, skipMatches, maxBucket, hasMore, truncated);
+    }
+    const int threads = qMax(1, qMin(QThread::idealThreadCount(), 8));
+    const int chunk = qMax(512, (n + threads - 1) / threads);
+    QVector<QPair<int, int>> ranges;
+    for (int lo = 0; lo < n; lo += chunk) {
+        ranges.push_back(qMakePair(lo, qMin(n, lo + chunk)));
+    }
+
+    QVector<QVector<FinderIndexedRecord>> parts;
+    parts.resize(ranges.size());
+    QVector<int> partIndexes;
+    partIndexes.reserve(ranges.size());
+    for (int i = 0; i < ranges.size(); ++i) {
+        partIndexes.push_back(i);
+    }
+
+    QtConcurrent::blockingMap(partIndexes, [&](int partIndex) {
+        const QPair<int, int> range = ranges.at(partIndex);
+        QVector<FinderIndexedRecord> local;
+        local.reserve(qMin(chunk, 4096));
+        int tick = 0;
+        for (int p = range.first; p < range.second; ++p) {
+            if (((++tick) & 511) == 0 && cancelToken && cancelToken->load()) {
+                break;
+            }
+            const int rawIndex = scanIndexes.at(p);
+            if (rawIndex < 0 || rawIndex >= snap.recordsLinear.size()) {
+                continue;
+            }
+            const FinderIndexedRecord &record = snap.recordsLinear.at(rawIndex);
+            if (recordMatchesKeyword(record, keyword, request)) {
+                local.push_back(record);
+            }
+        }
+        parts[partIndex] = std::move(local);
+    });
+
+    QVector<FinderIndexedRecord> combined;
+    int est = 0;
+    for (const QVector<FinderIndexedRecord> &part : parts) {
+        est += part.size();
+    }
+    combined.reserve(est);
+    for (const QVector<FinderIndexedRecord> &part : parts) {
+        combined += part;
+    }
+
+    qint64 ord = *matchedOrdinalInOut;
+    QVector<FinderIndexedRecord> bucket;
+    bucket.reserve(qMin(maxBucket, 65536));
+    int tick2 = 0;
+    for (const FinderIndexedRecord &rec : combined) {
+        if (((++tick2) & 511) == 0 && cancelToken && cancelToken->load()) {
+            *truncated = true;
+            break;
+        }
+        if (ord++ < skipMatches) {
+            continue;
+        }
+        if (bucket.size() >= maxBucket) {
+            *hasMore = true;
+            break;
+        }
+        bucket.push_back(rec);
+    }
+    *matchedOrdinalInOut = ord;
+    return bucket;
+}
+
+} // namespace
+
 FinderSearchOutcome Libfinder::search(const FinderSearchRequest &request, std::atomic<bool> *cancelToken)
 {
     FinderSearchOutcome outcome;
-    const QString cacheKey = QStringLiteral("%1|%2|%3|%4|%5")
+    const QString cacheKey = QStringLiteral("%1|%2|%3|%4|%5|%6")
             .arg(request.keyword)
             .arg(static_cast<int>(request.caseSensitivity))
             .arg(request.limit)
             .arg(request.pageSize)
-            .arg(request.pageIndex);
+            .arg(request.pageIndex)
+            .arg(request.fileNamesOnly ? 1 : 0);
 
     const bool emptyKeyword = request.keyword.trimmed().isEmpty();
     const bool useCache = !emptyKeyword && !cancelToken && request.pageIndex == 0;
@@ -1580,6 +2296,15 @@ FinderSearchOutcome Libfinder::search(const FinderSearchRequest &request, std::a
         }
     }
 
+    std::shared_ptr<const SearchIndexSnapshot> snap;
+    {
+        QMutexLocker locker(&d->searchSnapshotMutex);
+        snap = d->searchSnapshot;
+    }
+    if (!snap) {
+        return outcome;
+    }
+
     const int maxBucket = (request.pageSize <= 0) ? (INT_MAX / 4) : request.pageSize;
     const qint64 pageSize64 = (request.pageSize <= 0)
             ? (std::numeric_limits<qint64>::max() / 4)
@@ -1590,129 +2315,41 @@ FinderSearchOutcome Libfinder::search(const FinderSearchRequest &request, std::a
     bucket.reserve(qMin(maxBucket, 65536));
 
     qint64 matchedOrdinal = 0;
-    int iterTick = 0;
 
-    {
-        QReadLocker locker(&d->lock);
-        const QString keyword = request.caseSensitivity == Qt::CaseInsensitive
-                ? request.keyword.toLower()
-                : request.keyword;
+    const QString keyword = request.caseSensitivity == Qt::CaseInsensitive
+            ? request.keyword.toLower()
+            : request.keyword;
 
-        if (emptyKeyword) {
-            const int begin = static_cast<int>(qMin(skipMatches, static_cast<qint64>(d->recordsLinear.size())));
-            const int end = qMin(begin + maxBucket, d->recordsLinear.size());
-            if (end > begin) {
-                bucket.reserve(end - begin);
-                for (int i = begin; i < end; ++i) {
-                    bucket.push_back(d->recordsLinear.at(i));
-                }
+    if (emptyKeyword) {
+        const int begin = static_cast<int>(qMin(skipMatches, static_cast<qint64>(snap->recordsLinear.size())));
+        const int end = qMin(begin + maxBucket, snap->recordsLinear.size());
+        if (end > begin) {
+            bucket.reserve(end - begin);
+            for (int i = begin; i < end; ++i) {
+                bucket.push_back(snap->recordsLinear.at(i));
             }
-            outcome.hasMore = end < d->recordsLinear.size();
-        } else {
+        }
+        outcome.hasMore = end < snap->recordsLinear.size();
+    } else {
         const bool hasPathLikeChars = keyword.contains(QLatin1Char('/'))
                 || keyword.contains(QLatin1Char('\\'))
                 || keyword.contains(QLatin1Char(':'));
 
         QVector<int> candidateIndexes;
         bool useInvertedCandidates = false;
-
-        if (!emptyKeyword
-            && request.caseSensitivity == Qt::CaseInsensitive
-            && !hasPathLikeChars
-            && !d->nameInverted.isEmpty()) {
-            const QStringList queryTokens = tokenizeName(keyword);
-            if (!queryTokens.isEmpty()) {
-                bool canUse = true;
-                QVector<int> merged;
-
-                for (const QString &token : queryTokens) {
-                    const auto postingIt = d->nameInverted.constFind(token);
-                    if (postingIt == d->nameInverted.constEnd()) {
-                        canUse = false;
-                        break;
-                    }
-
-                    const QVector<int> &posting = postingIt.value();
-                    if (merged.isEmpty()) {
-                        merged = posting;
-                        continue;
-                    }
-
-                    QVector<int> intersection;
-                    intersection.reserve(qMin(merged.size(), posting.size()));
-                    int i = 0;
-                    int j = 0;
-                    while (i < merged.size() && j < posting.size()) {
-                        if (merged.at(i) == posting.at(j)) {
-                            intersection.push_back(merged.at(i));
-                            ++i;
-                            ++j;
-                        } else if (merged.at(i) < posting.at(j)) {
-                            ++i;
-                        } else {
-                            ++j;
-                        }
-                    }
-                    merged = std::move(intersection);
-                    if (merged.isEmpty()) {
-                        break;
-                    }
-                }
-
-                if (canUse) {
-                    candidateIndexes = std::move(merged);
-                    useInvertedCandidates = true;
-                }
-            }
+        if (!emptyKeyword && request.caseSensitivity == Qt::CaseInsensitive) {
+            tryBuildInvertedCandidateIndexes(snap.get(), keyword, request.fileNamesOnly, hasPathLikeChars,
+                                             &candidateIndexes, &useInvertedCandidates);
         }
 
-        const QVector<int> &scanIndexes = useInvertedCandidates ? candidateIndexes : d->allRecordIndexes;
+        const QVector<int> &scanIndexes = useInvertedCandidates ? candidateIndexes : snap->allRecordIndexes;
 
-        for (int rawIndex : scanIndexes) {
-            if (((++iterTick) & 2047) == 0 && cancelToken && cancelToken->load()) {
-                outcome.truncated = true;
-                return outcome;
-            }
-
-            if (rawIndex < 0 || rawIndex >= d->recordsLinear.size()) {
-                continue;
-            }
-            const FinderIndexedRecord &record = d->recordsLinear.at(rawIndex);
-            bool matched = emptyKeyword;
-            if (!matched) {
-                QString haystack;
-                if (request.caseSensitivity == Qt::CaseInsensitive) {
-                    if (!record.searchableText.isEmpty()) {
-                        haystack = record.searchableText;
-                    } else {
-                        const QString nameLower = record.nameLower.isEmpty()
-                                ? record.entry.name.toLower()
-                                : record.nameLower;
-                        const QString pathLower = record.pathLower.isEmpty()
-                                ? record.entry.path.toLower()
-                                : record.pathLower;
-                        haystack = QStringLiteral("%1 %2").arg(nameLower, pathLower);
-                    }
-                } else {
-                    haystack = QStringLiteral("%1 %2").arg(record.entry.name, record.entry.path);
-                }
-                matched = haystack.contains(keyword, request.caseSensitivity);
-            }
-            if (!matched) {
-                continue;
-            }
-
-            if (matchedOrdinal++ < skipMatches) {
-                continue;
-            }
-
-            if (bucket.size() >= maxBucket) {
-                outcome.hasMore = true;
-                break;
-            }
-            bucket.push_back(record);
-        }
-        }
+        bool hasMore = false;
+        bool truncated = false;
+        bucket = parallelScanMatches(*snap, scanIndexes, keyword, request, cancelToken, &matchedOrdinal,
+                                     skipMatches, maxBucket, &hasMore, &truncated);
+        outcome.hasMore = hasMore;
+        outcome.truncated = truncated;
     }
 
     if (emptyKeyword) {
@@ -1744,6 +2381,44 @@ FinderSearchOutcome Libfinder::search(const FinderSearchRequest &request, std::a
     return outcome;
 }
 
+FinderSearchOutcome Libfinder::browseIndexed(int pageSize, int pageIndex, std::atomic<bool> *cancelToken)
+{
+    FinderSearchOutcome outcome;
+    std::shared_ptr<const SearchIndexSnapshot> snap;
+    {
+        QMutexLocker locker(&d->searchSnapshotMutex);
+        snap = d->searchSnapshot;
+    }
+    if (!snap) {
+        return outcome;
+    }
+
+    const int effectivePageSize = (pageSize <= 0) ? (INT_MAX / 4) : pageSize;
+    const qint64 pageSize64 = (pageSize <= 0)
+            ? (std::numeric_limits<qint64>::max() / 4)
+            : static_cast<qint64>(pageSize);
+    const qint64 skipMatches = static_cast<qint64>(qMax(0, pageIndex)) * pageSize64;
+
+    const int begin = static_cast<int>(qMin(skipMatches, static_cast<qint64>(snap->recordsLinear.size())));
+    const int end = qMin(begin + effectivePageSize, snap->recordsLinear.size());
+
+    const int resultSize = qMax(0, end - begin);
+    outcome.results.reserve(resultSize);
+    int tick = 0;
+    for (int i = begin; i < end; ++i) {
+        if (((++tick) & 1023) == 0 && cancelToken && cancelToken->load()) {
+            outcome.truncated = true;
+            return outcome;
+        }
+        FinderSearchResult item;
+        item.entry = snap->recordsLinear.at(i).entry;
+        item.score = 10;
+        outcome.results.push_back(std::move(item));
+    }
+    outcome.hasMore = end < snap->recordsLinear.size();
+    return outcome;
+}
+
 bool Libfinder::commitIndexBuild(FinderIndexBuildOutcome outcome, QString *errorMessage)
 {
     if (!outcome.ok) {
@@ -1758,25 +2433,49 @@ bool Libfinder::commitIndexBuild(FinderIndexBuildOutcome outcome, QString *error
     const bool skipPersistenceWrite = outcome.loadedFromPersistence;
     const bool partialData = outcome.partialData;
     const FinderIndexOptions watchOptions = outcome.lastIndexOptions;
+    bool scheduleDeferredInvertedBuild = false;
 
     {
         QWriteLocker locker(&d->lock);
         d->recordsByPath = std::move(outcome.recordsByPath);
         d->recordsLinear = std::move(outcome.recordsLinear);
         d->nameInverted = std::move(outcome.nameInverted);
+        d->pathInverted = std::move(outcome.pathInverted);
         d->allRecordIndexes = std::move(outcome.allRecordIndexes);
         d->lastIndexOptions = outcome.lastIndexOptions;
         d->activeBackend = outcome.resolvedBackend;
         d->stats = outcome.stats;
-        if (d->recordsLinear.size() != d->recordsByPath.size() || d->allRecordIndexes.size() != d->recordsByPath.size()) {
-            if (!partialData) {
+        if (!partialData) {
+            if (d->recordsLinear.size() != d->recordsByPath.size()
+                || d->allRecordIndexes.size() != d->recordsByPath.size()) {
                 d->rebuildDerivedIndexes();
+            } else {
+                d->refreshSearchSnapshot();
             }
+        } else {
+            d->refreshSearchSnapshot();
         }
         if (!partialData) {
             d->stats.totalFiles = d->recordsByPath.size();
         }
         d->cache.clear();
+
+        if (!d->recordsLinear.isEmpty() && (d->nameInverted.isEmpty() || d->pathInverted.isEmpty())) {
+            d->deferredInvertedBuildPending = true;
+            ++d->deferredInvertedBuildRevision;
+            scheduleDeferredInvertedBuild = true;
+        } else {
+            d->deferredInvertedBuildPending = false;
+            ++d->deferredInvertedBuildRevision;
+            if (d->deferredInvertedBuildTimer) {
+                d->deferredInvertedBuildTimer->stop();
+            }
+        }
+    }
+
+    if (scheduleDeferredInvertedBuild && d->deferredInvertedBuildTimer) {
+        d->deferredInvertedBuildTimer->stop();
+        d->deferredInvertedBuildTimer->start();
     }
 
     if (partialData) {
@@ -1815,6 +2514,7 @@ bool Libfinder::commitIndexBuild(FinderIndexBuildOutcome outcome, QString *error
     if (skipPersistenceWrite) {
         return true;
     }
+    cancelDebouncedPersistedIndexSave();
     return savePersistedIndex(errorMessage);
 }
 
@@ -1832,63 +2532,68 @@ bool Libfinder::loadPersistedIndex(QString *errorMessage)
     return commitIndexBuild(std::move(bundle), errorMessage);
 }
 
-bool Libfinder::savePersistedIndex(QString *errorMessage) const
+bool Libfinder::savePersistedIndex(QString *errorMessage)
+{
+    waitForAsyncPersistFinished();
+    QByteArray blob;
+    QString pathCopy;
+    {
+        QReadLocker locker(&d->lock);
+        pathCopy = d->persistencePath;
+        if (!d->serializePersistedToBuffer(&blob, errorMessage)) {
+            return false;
+        }
+    }
+    return writeIndexBytesWithSaveFile(pathCopy, std::move(blob), errorMessage);
+}
+
+void Libfinder::setPersistenceSaveDebounceMs(int milliseconds)
+{
+    const int v = qBound(0, milliseconds, 600000);
+    QWriteLocker locker(&d->lock);
+    d->persistDebounceMs = v;
+    if (d->persistDebounceTimer && v > 0) {
+        d->persistDebounceTimer->setInterval(v);
+    }
+}
+
+int Libfinder::persistenceSaveDebounceMs() const
 {
     QReadLocker locker(&d->lock);
+    return d->persistDebounceMs;
+}
 
-    QFileInfo fileInfo(d->persistencePath);
-    QDir targetDir = fileInfo.dir();
-    if (!targetDir.exists() && !targetDir.mkpath(QStringLiteral("."))) {
-        if (errorMessage) {
-            *errorMessage = QStringLiteral("Cannot create index directory.");
-        }
-        return false;
+void Libfinder::setPersistenceAsyncWriteEnabled(bool enabled)
+{
+    QWriteLocker locker(&d->lock);
+    d->persistAsyncWriteEnabled = enabled;
+}
+
+bool Libfinder::persistenceAsyncWriteEnabled() const
+{
+    QReadLocker locker(&d->lock);
+    return d->persistAsyncWriteEnabled;
+}
+
+void Libfinder::setDeferredInvertedBuildDelayMs(int milliseconds)
+{
+    const int v = qBound(0, milliseconds, 600000);
+    QWriteLocker locker(&d->lock);
+    d->deferredInvertedBuildDelayMs = v;
+    if (d->deferredInvertedBuildTimer) {
+        d->deferredInvertedBuildTimer->setInterval(v);
     }
+}
 
-    QFile file(d->persistencePath);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        if (errorMessage) {
-            *errorMessage = QStringLiteral("Cannot write persisted index file.");
-        }
-        return false;
-    }
+int Libfinder::deferredInvertedBuildDelayMs() const
+{
+    QReadLocker locker(&d->lock);
+    return d->deferredInvertedBuildDelayMs;
+}
 
-    QDataStream out(&file);
-    const quint32 version = 3;
-    const quint32 recordCount = static_cast<quint32>(d->recordsByPath.size());
-    const qint64 indexedAtMs = d->stats.indexedAt.toMSecsSinceEpoch();
-    const qint32 backendValue = static_cast<qint32>(d->lastIndexOptions.backend);
-    const qint64 channelUpdatedAtMs = d->stats.channelUpdatedAt.toMSecsSinceEpoch();
-
-    out << version
-        << recordCount
-        << d->lastIndexOptions.roots
-        << d->lastIndexOptions.excludes
-        << d->lastIndexOptions.includeHidden
-        << d->lastIndexOptions.maxFiles
-        << backendValue
-        << indexedAtMs
-        << d->stats.channelState
-        << d->stats.channelDetail
-        << channelUpdatedAtMs
-        << d->stats.usnParsedRecords
-        << d->stats.usnErrorCount;
-
-    for (auto it = d->recordsByPath.constBegin(); it != d->recordsByPath.constEnd(); ++it) {
-        const FinderIndexedRecord &record = it.value();
-        out << record.entry.name
-            << record.entry.path
-            << record.entry.sizeBytes
-            << record.entry.lastModified.toMSecsSinceEpoch();
-    }
-
-    if (out.status() != QDataStream::Ok) {
-        if (errorMessage) {
-            *errorMessage = QStringLiteral("Persisted index encode failed.");
-        }
-        return false;
-    }
-    return true;
+void Libfinder::tuneDeferredInvertedBuildDelayForCurrentMachine()
+{
+    setDeferredInvertedBuildDelayMs(autoDeferredInvertedBuildDelayMs());
 }
 
 void Libfinder::setPersistenceFilePath(const QString &filePath)
@@ -1911,10 +2616,18 @@ FinderIndexOptions Libfinder::indexOptions() const
 
 void Libfinder::clear()
 {
+    cancelDebouncedPersistedIndexSave();
+    if (d->deferredInvertedBuildTimer) {
+        d->deferredInvertedBuildTimer->stop();
+    }
     QWriteLocker locker(&d->lock);
+    d->deferredInvertedBuildPending = false;
+    ++d->deferredInvertedBuildRevision;
+    d->runningDeferredInvertedBuildRevision = 0;
     d->recordsByPath.clear();
     d->recordsLinear.clear();
     d->nameInverted.clear();
+    d->pathInverted.clear();
     d->allRecordIndexes.clear();
     d->stats = FinderIndexStats();
     d->cache.clear();
@@ -1924,8 +2637,12 @@ void Libfinder::clear()
         d->usnPollTimer->stop();
     }
     if (d->watcher) {
-        d->watcher->removePaths(d->watcher->directories());
+        const QStringList dirs = d->watcher->directories();
+        if (!dirs.isEmpty()) {
+            d->watcher->removePaths(dirs);
+        }
     }
+    d->refreshSearchSnapshot();
 }
 
 FinderIndexStats Libfinder::stats() const

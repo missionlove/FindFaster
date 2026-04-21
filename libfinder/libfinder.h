@@ -9,6 +9,7 @@
 #include <QMetaType>
 #include <QString>
 #include <QStringList>
+#include <QStringView>
 #include <QVector>
 
 #include <atomic>
@@ -31,6 +32,8 @@ struct FinderSearchRequest
     int pageSize = 100000;
     /// 从第几页开始（0 为第一页）；与 pageSize 搭配做跳过。
     int pageIndex = 0;
+    /// 为 true 时仅在文件名中匹配/打分（忽略路径子串，略快）。
+    bool fileNamesOnly = false;
 };
 
 struct FinderSearchResult
@@ -98,6 +101,7 @@ struct LIBFINDER_EXPORT FinderIndexBuildOutcome
     QHash<QString, FinderIndexedRecord> recordsByPath;
     QVector<FinderIndexedRecord> recordsLinear;
     QHash<QString, QVector<int>> nameInverted;
+    QHash<QString, QVector<int>> pathInverted;
     QVector<int> allRecordIndexes;
     FinderIndexStats stats;
     FinderIndexOptions lastIndexOptions;
@@ -132,10 +136,24 @@ public:
     bool loadPersistedIndex(QString *errorMessage = nullptr);
     /// 将工作线程产出的索引提交到引擎，并在主线程配置 watcher / timer / 持久化。
     bool commitIndexBuild(FinderIndexBuildOutcome outcome, QString *errorMessage = nullptr);
-    bool savePersistedIndex(QString *errorMessage = nullptr) const;
+    bool savePersistedIndex(QString *errorMessage = nullptr);
+    /// 空关键词快速分页：直接从索引快照导出，不走通用匹配/排序流程。
+    FinderSearchOutcome browseIndexed(int pageSize, int pageIndex = 0, std::atomic<bool> *cancelToken = nullptr);
     FinderSearchOutcome search(const FinderSearchRequest &request, std::atomic<bool> *cancelToken = nullptr);
 
     void setPersistenceFilePath(const QString &filePath);
+    /// 增量持久化防抖间隔（毫秒）。0 表示变更后立即尝试写盘（仍合并同一线程内连续触发）。
+    void setPersistenceSaveDebounceMs(int milliseconds);
+    int persistenceSaveDebounceMs() const;
+    /// 为 true 时，防抖到期后在后台线程写入磁盘（主线程仅做内存序列化）；为 false 时全程同步写盘。
+    void setPersistenceAsyncWriteEnabled(bool enabled);
+    bool persistenceAsyncWriteEnabled() const;
+    /// 启动后延迟后台构建倒排索引的等待时间（毫秒）。0 表示尽快在事件循环空闲时触发。
+    void setDeferredInvertedBuildDelayMs(int milliseconds);
+    int deferredInvertedBuildDelayMs() const;
+    /// 按当前机器配置（CPU/内存）自动选择倒排延迟时间。
+    void tuneDeferredInvertedBuildDelayForCurrentMachine();
+
     QString persistenceFilePath() const;
     FinderIndexOptions indexOptions() const;
 
@@ -143,6 +161,12 @@ public:
     FinderIndexStats stats() const;
 
 private:
+    void schedulePersistedIndexSave();
+    void cancelDebouncedPersistedIndexSave();
+    void waitForAsyncPersistFinished();
+    void flushDebouncedPersistSave();
+    void startAsyncPersistWrite();
+
     struct Impl;
     Impl *d = nullptr;
 };

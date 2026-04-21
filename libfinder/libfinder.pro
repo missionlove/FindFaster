@@ -1,4 +1,5 @@
 QT -= gui
+QT += concurrent
 
 TEMPLATE = lib
 DEFINES += LIBFINDER_LIBRARY

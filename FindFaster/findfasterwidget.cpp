@@ -56,6 +56,24 @@ QString csvEscapeField(const QString &s)
     }
     return out;
 }
+
+QString buildWindowTitle(const QString &keyword)
+{
+    const QString trimmed = keyword.trimmed();
+    if (trimmed.isEmpty()) {
+        return QStringLiteral("findfaster");
+    }
+    return QStringLiteral("%1 - findfaster").arg(trimmed);
+}
+
+int computeEmptyQueryPageSize(const FinderIndexStats &stats)
+{
+    if (stats.totalFiles <= 0) {
+        return 50000;
+    }
+    // 尽量单次拉取全量，避免分页往返带来的启动抖动。
+    return qMax(1000, stats.totalFiles);
+}
 } // namespace
 
 FindFasterWidget::FindFasterWidget(QWidget *parent)
@@ -101,15 +119,23 @@ void FindFasterWidget::refreshSearch()
     }
 
     const QString keyword = m_searchEdit->text();
+    setWindowTitle(buildWindowTitle(keyword));
     m_prefetchHitForCurrentQuery = false;
     FinderSearchRequest request;
     request.keyword = keyword;
     request.pageSize = kPrefetchPageSize;
     request.pageIndex = 0;
     request.limit = request.pageSize;
+    const QString trimmed = keyword.trimmed();
+    const bool hasPathLikeChars = keyword.contains(QLatin1Char('/'))
+            || keyword.contains(QLatin1Char('\\'))
+            || keyword.contains(QLatin1Char(':'));
+    if (!trimmed.isEmpty() && trimmed.size() <= 2 && !hasPathLikeChars) {
+        request.fileNamesOnly = true;
+    }
 
     if (keyword.isEmpty()) {
-        request.pageSize = kFirstFramePageSize;
+        request.pageSize = computeEmptyQueryPageSize(m_engine.stats());
         request.limit = request.pageSize;
         m_prefetchInProgress = false;
         submitSearch(request, true);
@@ -135,6 +161,7 @@ void FindFasterWidget::onSearchCommitted()
     }
 
     const QString keyword = m_searchEdit->text();
+    setWindowTitle(buildWindowTitle(keyword));
     m_prefetchHitForCurrentQuery = false;
     if (!keyword.isEmpty()) {
         m_prefetchHitForCurrentQuery = tryApplyPrefetchForCommittedQuery(keyword);
@@ -145,9 +172,18 @@ void FindFasterWidget::onSearchCommitted()
 
     FinderSearchRequest request;
     request.keyword = keyword;
-    request.pageSize = keyword.trimmed().isEmpty() ? kFirstFramePageSize : 100000;
+    request.pageSize = keyword.trimmed().isEmpty()
+            ? computeEmptyQueryPageSize(m_engine.stats())
+            : 100000;
     request.pageIndex = 0;
     request.limit = request.pageSize;
+    const QString trimmed = keyword.trimmed();
+    const bool hasPathLikeChars = keyword.contains(QLatin1Char('/'))
+            || keyword.contains(QLatin1Char('\\'))
+            || keyword.contains(QLatin1Char(':'));
+    if (!trimmed.isEmpty() && trimmed.size() <= 2 && !hasPathLikeChars) {
+        request.fileNamesOnly = true;
+    }
     submitSearch(request, true);
 }
 
@@ -176,7 +212,7 @@ void FindFasterWidget::updateStatus()
     const QString channelText = NtfsUsnUtils::formatChannelStatus(stats.channelState,
                                                                   stats.channelDetail,
                                                                   stats.channelUpdatedAt);
-    const QString metrics = startupMetricsText();
+    const QString metrics = startupMetricsText() + runtimeMetricsText();
     m_rightStatus->setText(QStringLiteral("后端: %1 | 通道: %2 | USN解析: %3 | USN错误: %4%5")
                            .arg(stats.backend)
                            .arg(channelText)
@@ -187,7 +223,7 @@ void FindFasterWidget::updateStatus()
 
 void FindFasterWidget::buildUi()
 {
-    setWindowTitle(QStringLiteral("FindFaster"));
+    setWindowTitle(QStringLiteral("findfaster"));
     resize(1100, 720);
 
     QWidget *central = new QWidget(this);
@@ -430,6 +466,8 @@ void FindFasterWidget::runDeferredIndexBuild()
 
 void FindFasterWidget::applyDisplayResults()
 {
+    QElapsedTimer elapsed;
+    elapsed.start();
     if (!m_resultModel || !m_driveFilterCombo) {
         return;
     }
@@ -437,10 +475,20 @@ void FindFasterWidget::applyDisplayResults()
     const QString driveFilter = m_driveFilterCombo->currentData().toString();
     if (driveFilter.isEmpty()) {
         if (!m_progressiveRenderTimer->isActive() && m_displayedSearchResults.size() != m_allSearchResults.size()) {
-            m_displayedSearchResults = m_allSearchResults;
+            const int firstRow = m_displayedSearchResults.size();
+            m_displayedSearchResults.reserve(m_allSearchResults.size());
+            for (int i = firstRow; i < m_allSearchResults.size(); ++i) {
+                m_displayedSearchResults.push_back(m_allSearchResults.at(i));
+            }
             m_progressiveNextIndex = m_displayedSearchResults.size();
+            if (m_resultModel->isUsingExternalSource(&m_displayedSearchResults) && firstRow < m_displayedSearchResults.size()) {
+                m_resultModel->notifyExternalRowsInserted(firstRow, m_displayedSearchResults.size() - 1);
+                m_lastApplyDisplayMs = elapsed.elapsed();
+                return;
+            }
         }
         m_resultModel->setExternalSource(&m_displayedSearchResults);
+        m_lastApplyDisplayMs = elapsed.elapsed();
         return;
     }
 
@@ -456,6 +504,7 @@ void FindFasterWidget::applyDisplayResults()
         }
     }
     m_resultModel->setOwnedRows(std::move(filtered));
+    m_lastApplyDisplayMs = elapsed.elapsed();
 }
 
 void FindFasterWidget::submitSearch(const FinderSearchRequest &request, bool forDisplay)
@@ -484,10 +533,6 @@ void FindFasterWidget::maybeContinueInitialWarmup()
     if (!m_hasMorePages || m_pageLoadInProgress || m_mainSearchWatcher->isRunning()) {
         return;
     }
-    if (m_allSearchResults.size() >= kInitialDisplayPageSize) {
-        return;
-    }
-
     QTimer::singleShot(0, this, &FindFasterWidget::startLoadNextPage);
 }
 
@@ -514,6 +559,41 @@ QString FindFasterWidget::startupMetricsText() const
         return QStringLiteral(" | 启动埋点采集中");
     }
     return QStringLiteral(" | 启动埋点: %1").arg(parts.join(QStringLiteral(", ")));
+}
+
+QString FindFasterWidget::runtimeMetricsText() const
+{
+    if (m_lastSearchComputeMs < 0 && m_lastApplyDisplayMs < 0) {
+        return QString();
+    }
+    QStringList parts;
+    if (m_lastSearchComputeMs >= 0) {
+        parts << QStringLiteral("检索 %1ms").arg(m_lastSearchComputeMs);
+    }
+    if (m_lastApplyDisplayMs >= 0) {
+        parts << QStringLiteral("渲染应用 %1ms").arg(m_lastApplyDisplayMs);
+    }
+    parts << QStringLiteral("分块 %1行").arg(m_renderChunkRows);
+    return QStringLiteral(" | 运行埋点: %1").arg(parts.join(QStringLiteral(", ")));
+}
+
+void FindFasterWidget::adaptRenderChunkRows()
+{
+    int chunk = m_renderChunkRows;
+
+    if (m_lastApplyDisplayMs > 16) {
+        chunk = qMax(kRenderChunkRowsMin, chunk - 40);
+    } else if (m_lastApplyDisplayMs >= 0 && m_lastApplyDisplayMs < 8) {
+        chunk = qMin(kRenderChunkRowsMax, chunk + 30);
+    }
+
+    if (m_lastSearchComputeMs >= 0 && m_lastSearchComputeMs < 10) {
+        chunk = qMin(kRenderChunkRowsMax, chunk + 40);
+    } else if (m_lastSearchComputeMs > 50) {
+        chunk = qMax(kRenderChunkRowsMin, chunk - 20);
+    }
+
+    m_renderChunkRows = chunk;
 }
 
 void FindFasterWidget::logStartupMetricsIfReady()
@@ -574,7 +654,14 @@ void FindFasterWidget::beginSearchNow(const FinderSearchRequest &request, bool f
         job.token = jobToken;
         job.forDisplay = forDisplay;
         job.keyword = request.keyword;
-        job.outcome = m_engine.search(request, cancel.get());
+        QElapsedTimer timer;
+        timer.start();
+        if (request.keyword.trimmed().isEmpty()) {
+            job.outcome = m_engine.browseIndexed(request.pageSize, request.pageIndex, cancel.get());
+        } else {
+            job.outcome = m_engine.search(request, cancel.get());
+        }
+        job.searchMs = timer.elapsed();
         return job;
     });
     m_mainSearchWatcher->setFuture(future);
@@ -583,6 +670,8 @@ void FindFasterWidget::beginSearchNow(const FinderSearchRequest &request, bool f
 void FindFasterWidget::onMainSearchFinished()
 {
     FinderSearchJob job = m_mainSearchWatcher->result();
+    m_lastSearchComputeMs = job.searchMs;
+    adaptRenderChunkRows();
 
     if (m_hasQueuedRequest) {
         m_hasQueuedRequest = false;
@@ -633,6 +722,8 @@ void FindFasterWidget::onMainSearchFinished()
 void FindFasterWidget::onPageSearchFinished()
 {
     FinderSearchJob job = m_pageSearchWatcher->result();
+    m_lastSearchComputeMs = job.searchMs;
+    adaptRenderChunkRows();
     m_pageLoadInProgress = false;
 
     if (job.token != m_searchToken) {
@@ -722,7 +813,14 @@ void FindFasterWidget::startLoadNextPage()
     const QFuture<FinderSearchJob> future = QtConcurrent::run([this, request, cancel, jobToken]() {
         FinderSearchJob job;
         job.token = jobToken;
-        job.outcome = m_engine.search(request, cancel.get());
+        QElapsedTimer timer;
+        timer.start();
+        if (request.keyword.trimmed().isEmpty()) {
+            job.outcome = m_engine.browseIndexed(request.pageSize, request.pageIndex, cancel.get());
+        } else {
+            job.outcome = m_engine.search(request, cancel.get());
+        }
+        job.searchMs = timer.elapsed();
         return job;
     });
     m_pageSearchWatcher->setFuture(future);
@@ -981,6 +1079,8 @@ bool FindFasterWidget::tryApplyPrefetchForCommittedQuery(const QString &keyword)
 
 void FindFasterWidget::startProgressiveDisplay()
 {
+    QElapsedTimer elapsed;
+    elapsed.start();
     if (!m_resultModel) {
         return;
     }
@@ -989,8 +1089,17 @@ void FindFasterWidget::startProgressiveDisplay()
         m_progressiveRenderTimer->stop();
     }
 
+    if (m_allSearchResults.size() <= kFastFullAttachRows) {
+        m_displayedSearchResults = m_allSearchResults;
+        m_progressiveNextIndex = m_displayedSearchResults.size();
+        m_resultModel->setExternalSource(&m_displayedSearchResults);
+        m_lastApplyDisplayMs = elapsed.elapsed();
+        return;
+    }
+
     m_displayedSearchResults.clear();
-    const int firstPaintCount = qMin(kFirstPaintRows, m_allSearchResults.size());
+    const int firstPaintGoal = m_startupTimingActive ? qMax(kFirstPaintRows, 200) : kFirstPaintRows;
+    const int firstPaintCount = qMin(firstPaintGoal, m_allSearchResults.size());
     if (firstPaintCount > 0) {
         m_displayedSearchResults.reserve(m_allSearchResults.size());
         for (int i = 0; i < firstPaintCount; ++i) {
@@ -999,8 +1108,12 @@ void FindFasterWidget::startProgressiveDisplay()
     }
     m_progressiveNextIndex = firstPaintCount;
     m_resultModel->setExternalSource(&m_displayedSearchResults);
+    m_lastApplyDisplayMs = elapsed.elapsed();
 
     if (m_progressiveNextIndex < m_allSearchResults.size()) {
+        if (m_startupTimingActive) {
+            m_renderChunkRows = qMax(m_renderChunkRows, 1000);
+        }
         m_progressiveRenderTimer->start();
     }
 }
@@ -1065,6 +1178,8 @@ void FindFasterWidget::stabilizeFirstRows(QList<FinderSearchResult> *results) co
 
 void FindFasterWidget::onProgressiveRenderTick()
 {
+    QElapsedTimer elapsed;
+    elapsed.start();
     if (!m_resultModel || !m_driveFilterCombo) {
         if (m_progressiveRenderTimer->isActive()) {
             m_progressiveRenderTimer->stop();
@@ -1081,7 +1196,7 @@ void FindFasterWidget::onProgressiveRenderTick()
     }
 
     const int firstRow = m_displayedSearchResults.size();
-    const int nextEnd = qMin(m_progressiveNextIndex + kRenderChunkRows, m_allSearchResults.size());
+    const int nextEnd = qMin(m_progressiveNextIndex + m_renderChunkRows, m_allSearchResults.size());
     for (int i = m_progressiveNextIndex; i < nextEnd; ++i) {
         m_displayedSearchResults.push_back(m_allSearchResults.at(i));
     }
@@ -1095,5 +1210,7 @@ void FindFasterWidget::onProgressiveRenderTick()
     if (m_progressiveNextIndex >= m_allSearchResults.size()) {
         m_progressiveRenderTimer->stop();
     }
+    m_lastApplyDisplayMs = elapsed.elapsed();
+    adaptRenderChunkRows();
     updateStatus();
 }

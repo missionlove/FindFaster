@@ -140,6 +140,18 @@ void FinderResultsModel::setExternalSource(const QList<FinderSearchResult> *sour
 
 void FinderResultsModel::setOwnedRows(QList<FinderSearchResult> &&rows)
 {
+    if (!m_externalSource && m_ownedRows.size() == rows.size()) {
+        bool same = true;
+        for (int i = 0; i < rows.size(); ++i) {
+            if (m_ownedRows.at(i).entry.path != rows.at(i).entry.path || m_ownedRows.at(i).score != rows.at(i).score) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            return;
+        }
+    }
     beginResetModel();
     m_externalSource = nullptr;
     m_ownedRows = std::move(rows);
@@ -161,6 +173,14 @@ void FinderResultsModel::notifyExternalRowsInserted(int firstRow, int lastRowInc
     }
     beginInsertRows(QModelIndex(), firstRow, lastRowInclusive);
     endInsertRows();
+}
+
+bool FinderResultsModel::isUsingExternalSource(const QList<FinderSearchResult> *source) const
+{
+    if (!m_externalSource) {
+        return false;
+    }
+    return !source || m_externalSource == source;
 }
 
 QString FinderResultsModel::pathAtRow(int row) const
